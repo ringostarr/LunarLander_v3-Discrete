@@ -14,7 +14,7 @@ class ActorCriticNetwork(nn.Module):
     This architecture is common for both A2C and PPO.
     """
 
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
+    def __init__(self, state_dim, action_dim, hidden_dim=512):
         super().__init__()
 
         # Shared layers process the state input
@@ -58,7 +58,7 @@ class PPOAgent:
     A PPO agent configured to train on LunarLander-v3.
     """
 
-    def __init__(self, env, lr=3e-4, gamma=0.999, gae_lambda=0.95, value_coeff=0.5,
+    def __init__(self, env, lr=8.33e-5, gamma=0.999, gae_lambda=0.98, value_coeff=0.5,
                  max_grad_norm=0.5, n_steps=2048, n_epochs=10, minibatch_size=64,
                  clip_range=0.2,
                  ema_alpha=0.1):
@@ -127,20 +127,20 @@ class PPOAgent:
         states, actions, rewards, values, dones, log_probs = [], [], [], [], [], []
 
         current_state = self.get_current_state()
-
+        steps_ = 0
         for _ in range(self.n_steps):
             state_tensor = torch.FloatTensor(current_state).unsqueeze(0)
 
             with torch.no_grad():
                 action, log_prob, _, value = self.network.get_action_and_value(state_tensor)
-
+            steps_+=1
             action_np = action.item()
             next_state, reward, terminated, truncated, _ = self.env.step(action_np)
             done = terminated or truncated
 
             states.append(current_state)
             actions.append(action.squeeze())
-            rewards.append(reward)
+            rewards.append(reward - 0.001*steps_)
             values.append(value.squeeze())
             dones.append(done)
             log_probs.append(log_prob.squeeze())
@@ -154,6 +154,7 @@ class PPOAgent:
                 self.current_episode_return = 0
                 current_state, _ = self.env.reset()
                 self.episode_count += 1
+                steps_ = 0
             else:
                 current_state = next_state
 
@@ -340,7 +341,7 @@ if __name__ == "__main__":
     # Set entropy_power to a higher value for a more aggressive, non-linear decay
     agent = PPOAgent(env)
 
-    agent.train(total_timesteps=600_000)
+    agent.train(total_timesteps=800_000)
 
     print("Plotting results...")
     plot_average_returns(agent.episode_returns, 50)
