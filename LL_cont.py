@@ -48,3 +48,4 @@ reward = -100 * sqrt(x^2 + y^2)             # Distance to pad center
          -100 * abs(angle)                  # Angle deviation penalty
          + 10 * leg1_contact                # Bonus for left leg contact
          + 10 * leg2_contact                # Bonus for right leg contact
+

@@ -8,14 +8,14 @@ import matplotlib.pyplot as plt
 from torch.distributions import Normal
 from torch.distributions.transforms import TanhTransform
 from torch.distributions import TransformedDistribution
-
+from transformers import pipeline
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 
 class ActorCriticNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
+    def __init__(self, state_dim, action_dim, hidden_dim=128):
         super().__init__()
 
         # Shared layers
@@ -31,7 +31,7 @@ class ActorCriticNetwork(nn.Module):
 
         # Policy head
         self.mu_head = nn.Linear(hidden_dim, action_dim)
-        self.log_std = nn.Parameter(torch.zeros(action_dim))
+        self.log_std = nn.Parameter(torch.ones(action_dim))
 
     def forward(self, state):
         shared_features = self.shared(state)
@@ -44,7 +44,7 @@ class ActorCriticNetwork(nn.Module):
         mu, std, value = self.forward(state)
         base_dist = Normal(mu, std)
         raw_action = base_dist.rsample()  # Sample from Normal
-        action = torch.clamp(torch.tanh(raw_action),min=-0.999,max=0.999)  # Squash
+        action = torch.clamp(torch.tanh(raw_action),min=-0.99,max=0.99)  # Squash
 
         log_prob = base_dist.log_prob(raw_action)
         log_prob -= 2 * (np.log(2) - raw_action - F.softplus(-2 * raw_action))  # Tanh correction
@@ -55,7 +55,7 @@ class ActorCriticNetwork(nn.Module):
 
 class PPOAgent:
     def __init__(self, env, lr=3e-4, gamma=0.999, gae_lambda=0.98, value_coeff=0.5,
-                 max_grad_norm=0.5, n_steps=2048, n_epochs=10, minibatch_size=64,
+                 max_grad_norm=0.5, n_steps=2048, n_epochs=10, minibatch_size=128,
                  clip_range=0.2, entropy_coeff=0.01, max_entropy_coeff=0.05, min_entropy_coeff=0.001):
 
         self.env = env
@@ -94,7 +94,9 @@ class PPOAgent:
         log_probs = []
 
         current_state = self.state
-
+        _nstep = 0
+        side_rewards = []
+        vertical_rewards = []
         for step in range(self.n_steps):
             state_tensor = torch.FloatTensor(current_state).unsqueeze(0).to(device)
 
@@ -107,15 +109,16 @@ class PPOAgent:
 
             states.append(current_state)
             actions.append(action.squeeze())
-            rewards.append(reward)
+            rewards.append((reward/50))
             values.append(value.squeeze())
             dones.append(done)
             log_probs.append(log_prob.squeeze())
             pos_x, pos_y = current_state[0], current_state[1]
             vel_x, vel_y = current_state[2], current_state[3]
+            angle = current_state[4]
+            side_reward = -abs(pos_x) - abs(vel_x) - angle
+            vertical_reward = -abs(pos_y) - abs(vel_y) + current_state[6]+current_state[7]
 
-            side_reward = -abs(pos_x) - abs(vel_x)
-            vertical_reward = -abs(pos_y) - abs(vel_y)
             if self.side_reward_ema == 0:
                 self.side_reward_ema = side_reward
             else:
@@ -125,26 +128,34 @@ class PPOAgent:
                 self.vertical_reward_ema = vertical_reward
             else:
                 self.vertical_reward_ema = self.ema_alpha * vertical_reward + (1 - self.ema_alpha) * self.vertical_reward_ema
-
+            side_rewards.append(self.side_reward_ema)
+            vertical_rewards.append(self.vertical_reward_ema)
             self.current_episode_return += reward
             self.total_timesteps += 1
 
             if done:
                 self.episode_returns.append(self.current_episode_return)
                 self.current_episode_return = 0
+                _nstep = 0
                 current_state, _ = self.env.reset()
             else:
                 current_state = next_state
+                _nstep += 1
 
         self.state = current_state
 
         # Convert to tensors
+
+        side_rewards_tensor = torch.FloatTensor(side_rewards)  # shape: [T]
+        vertical_rewards_tensor = torch.FloatTensor(vertical_rewards)
         states_tensor = torch.stack([torch.FloatTensor(s) for s in states]).to(device)
         actions_tensor = torch.stack(actions).to(device)
         rewards_tensor = torch.FloatTensor(rewards).to(device)
         values_tensor = torch.stack(values).to(device)
         dones_tensor = torch.tensor(dones, dtype=torch.bool).to(device)
         log_probs_tensor = torch.stack(log_probs).to(device)
+        side_reward_ema = side_rewards_tensor.to(device)
+        vertical_reward_ema = vertical_rewards_tensor.to(device)
 
         # Compute next value for GAE
         with torch.no_grad():
@@ -166,36 +177,21 @@ class PPOAgent:
             'returns': returns,
             'advantages': advantages,
             'old_log_probs': log_probs_tensor,
-            'old_values': values_tensor.clone().detach()
+            'old_values': values_tensor.clone().detach(),
+            'side_reward_ema':side_reward_ema,
+            'vertical_reward_ema' : vertical_reward_ema
         }
 
-    def compute_adaptive_entropy_coeffs(self, states):
-        """
-        Compute action-dimension-wise entropy coefficients based on position.
-        For LunarLander:
-        - Action 0: Side thrusters (left/right) - depends on X position
-        - Action 1: Vertical thrusters (main engine) - depends on Y position
+    def smooth_ema_per_sample(self, reward_tensor, alpha=0.1):
+        if reward_tensor.numel() == 0:
+            print("safety")
+            return reward_tensor  # return empty tensor safely
 
-        Scale coefficients from 0 to max_entropy_coeff based on position coordinates.
-        """
-        # Extract X and Y coordinates (positions 0 and 1 in state)
-        x_pos = states[:, 0]  # X coordinate
-        y_pos = states[:, 1]  # Y coordinate
-
-        # Normalize positions to [0, 1] range
-        # LunarLander X typically ranges from -1.5 to 1.5, Y from -0.5 to 1.5
-        x_normalized = torch.clamp((x_pos + 1.5) / 3.0, 0, 1)  # X from [-1.5, 1.5] to [0, 1]
-        y_normalized = torch.clamp((y_pos + 0.5) / 2.0, 0, 1)  # Y from [-0.5, 1.5] to [0, 1]
-
-        # Compute entropy coefficients for each action dimension
-        # Higher entropy when further from center/landing pad
-        side_thruster_entropy = self.max_entropy_coeff * torch.abs(
-            x_normalized - 0.5) * 2  # Scale back to [0, max_coeff]
-        vertical_thruster_entropy = self.max_entropy_coeff * (1.0 - y_normalized)  # More entropy when higher up
-
-        # Stack to create [batch_size, 2] tensor
-        entropy_coeffs = torch.stack([side_thruster_entropy, vertical_thruster_entropy], dim=1)
-
+        ema_rewards = torch.zeros_like(reward_tensor)
+        ema_rewards[0] = reward_tensor[0]
+        for t in range(1, reward_tensor.shape[0]):
+            ema_rewards[t] = alpha * reward_tensor[t] + (1 - alpha) * ema_rewards[t - 1]
+        return ema_rewards
     def compute_gae(self, rewards, values, dones, next_value):
         advantages = torch.zeros_like(rewards)
         gae = 0
@@ -233,51 +229,47 @@ class PPOAgent:
                 mb_states = states[indices]
                 mb_actions = actions[indices]
                 mb_returns = returns[indices]
-                mb_returns = (mb_returns - mb_returns.mean()) / (mb_returns.std() + 1e-8)
+              #  mb_returns = (mb_returns - mb_returns.mean()) / (mb_returns.std() + 1e-8)
                 mb_advantages = advantages[indices]
                 mb_old_log_probs = old_log_probs[indices]
                 mb_old_values = rollouts['old_values'][indices]
-                mb_old_values = (mb_old_values - mb_old_values.mean()) / (mb_old_values.std() + 1e-8)
+               # mb_old_values = (mb_old_values - mb_old_values.mean()) / (mb_old_values.std() + 1e-8)
                 # Compute adaptive entropy coefficients based on states
-                # Extract X and Y coordinates
-                x_pos = mb_states[:, 0]
-                y_pos = mb_states[:, 1]
-
-                # Compute distances from optimal position (0,0)
-                x_distance = torch.abs(x_pos)
-                y_distance = torch.abs(y_pos)
-                min_coeff = 0.005
-                max_coeff = 0.05
-                # Normalize distances
-                x_distance_norm = torch.clamp(x_distance / 1.5, 0, 1)
-                y_distance_norm = torch.clamp(y_distance / 1.5, 0, 1)
-                side_rew_norm = 1/(1+torch.exp(torch.tensor(-self.side_reward_ema)))
-                vert_rew_norm = 1/(1+torch.exp(torch.tensor(-self.vertical_reward_ema)))
+                side_rewards = rollouts['side_reward_ema'][indices]
+                vertical_rewards = rollouts['vertical_reward_ema'][indices]
                 # Scale entropy coefficients
-                entropy_range = self.max_entropy_coeff - self.min_entropy_coeff
-                vertical_entropy = self.scale_entropy_coeff(self.vertical_reward_ema)
-                side_entropy_coeff = self.scale_entropy_coeff(self.side_reward_ema)
+                vertical_entropy = self.scale_entropy_coeff(side_rewards)
+                side_entropy_coeff = self.scale_entropy_coeff(vertical_rewards)
                 # Create entropy coefficients tensor
                # side_entropy_coeff = torch.tensor(side_entropy_coeff, device=device)
                 #vertical_entropy = torch.tensor(vertical_entropy, device=device)
-                entropy_coeffs = torch.stack([side_entropy_coeff, vertical_entropy], dim=0).to(device)
+                entropy_coeffs = torch.stack([side_entropy_coeff, vertical_entropy], dim=1).to(device)
 
                 all_entropy_coeffs.append(entropy_coeffs)
 
                 # Forward pass
                 mu, std, values = self.network(mb_states)
                 base_dist = Normal(mu, std)
-                dist = TransformedDistribution(base_dist, [TanhTransform()])
+                clipped_actions = torch.clamp(mb_actions, -0.999, 0.999)
 
-                log_probs = dist.log_prob(mb_actions).sum(dim=-1)
+                # Inverse tanh (atanh) to recover raw action before squashing
+                raw_actions = 0.5 * (torch.log1p(clipped_actions) - torch.log1p(-clipped_actions))
+
+                # Compute log probs under the current policy
+                log_prob = base_dist.log_prob(raw_actions)
+                log_prob -= 2 * (np.log(2) - raw_actions - F.softplus(-2 * raw_actions))  # Tanh correction
+                log_prob = log_prob.sum(dim=-1)
                 entropy_per_action = base_dist.entropy()  # Shape: [batch_size, action_dim]
                 values = values.squeeze()
-                values = (values - values.mean()) / (values.std() + 1e-8)
+                #values = (values - values.mean()) / (values.std() + 1e-8)
                 #old_values = rollouts['old_values']
                 # PPO clipped loss
-                ratio = torch.exp(log_probs - mb_old_log_probs.detach())
-                clipped_ratio = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range)
-                policy_loss = -torch.min(ratio * mb_advantages, clipped_ratio * mb_advantages).mean()
+                ratio = torch.exp(log_prob - mb_old_log_probs.detach())
+               # clipped_ratio = torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range)
+                #policy_loss = -torch.min(ratio * mb_advantages, clipped_ratio * mb_advantages).mean()
+                epsilon = self.clip_range
+                policy_loss_elements = ratio * mb_advantages - (mb_advantages.abs() / (2 * epsilon)) * (ratio - 1).pow(2)
+                policy_loss = -policy_loss_elements.mean()
 
                 # Value loss
                 value_pred_clipped = mb_old_values + (values - mb_old_values).clamp(-0.2, 0.2)
@@ -304,7 +296,8 @@ class PPOAgent:
 
         # Compute average entropy coefficients for logging
         if all_entropy_coeffs:
-            avg_entropy_coeffs = torch.stack(all_entropy_coeffs, dim=0).mean(dim=0)
+            avg_entropy_coeffs = torch.stack(all_entropy_coeffs, dim=0)  # shape: [64, 64, 2]
+            avg_entropy_coeffs = avg_entropy_coeffs.mean(dim=(0, 1))
             avg_side_entropy_coeff = avg_entropy_coeffs[0].item()
             avg_vertical_entropy_coeff = avg_entropy_coeffs[1].item()
         else:
@@ -319,10 +312,11 @@ class PPOAgent:
             'avg_vertical_entropy_coeff': avg_vertical_entropy_coeff
         }
 
-    def scale_entropy_coeff(self,reward, min_reward=-2, max_reward=0, min_coeff=0.005, max_coeff=0.02):
-        reward_clipped = max(min_reward, min(max_reward, reward))
+    def scale_entropy_coeff(self, reward, min_reward=-2, max_reward=0, min_coeff=0.01, max_coeff=0.01):
+        reward_tensor = torch.tensor(reward) if not isinstance(reward, torch.Tensor) else reward
+        reward_clipped = torch.clamp(reward_tensor, min=min_reward, max=max_reward)
         t = (reward_clipped - min_reward) / (max_reward - min_reward)  # scales to [0, 1]
-        return torch.tensor(max_coeff - t * (max_coeff - min_coeff))
+        return max_coeff - t * (max_coeff - min_coeff)
 
     def train(self, total_timesteps=1_000_000):
         num_updates = total_timesteps // self.n_steps
@@ -419,23 +413,25 @@ if __name__ == "__main__":
     # Create environment
     env = gym.make('LunarLanderContinuous-v3')
 
+
     # Create PPO agent with adaptive entropy
     agent = PPOAgent(
         env=env,
-        lr=8.33e-5,
-        gamma=0.999,
+        lr=1e-4,
+        gamma=0.99,
         gae_lambda=0.98,
-        n_steps=1024,
-        n_epochs=4,
-        minibatch_size=64,
+        n_steps=2048,
+        n_epochs=10,
+        minibatch_size=256,
         clip_range=0.2,
         entropy_coeff=0.01,  # Base entropy coefficient (not used in adaptive version)
         max_entropy_coeff=0.02,
-        value_coeff=0.5,# Maximum entropy coefficient for scaling
+        value_coeff=0.6,# Maximum entropy coefficient for scaling
         min_entropy_coeff=0.005  # Minimum entropy coefficient for scaling
     )
 
     try:
+
         # Train the agent
         agent.train(total_timesteps=1_000_000)
 
@@ -447,7 +443,7 @@ if __name__ == "__main__":
 
         # Test the trained agent
         print("\nTesting trained agent...")
-        test_agent(agent, num_episodes=5)
+        test_agent(agent, num_episodes=50)
 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user")
