@@ -109,7 +109,7 @@ class PPOAgent:
 
             states.append(current_state)
             actions.append(action.squeeze())
-            rewards.append((reward/50))
+            rewards.append((reward/50)-0.0001*_nstep)
             values.append(value.squeeze())
             dones.append(done)
             log_probs.append(log_prob.squeeze())
@@ -312,7 +312,7 @@ class PPOAgent:
             'avg_vertical_entropy_coeff': avg_vertical_entropy_coeff
         }
 
-    def scale_entropy_coeff(self, reward, min_reward=-2, max_reward=0, min_coeff=0.01, max_coeff=0.01):
+    def scale_entropy_coeff(self, reward, min_reward=-2, max_reward=0, min_coeff=0.005, max_coeff=0.03):
         reward_tensor = torch.tensor(reward) if not isinstance(reward, torch.Tensor) else reward
         reward_clipped = torch.clamp(reward_tensor, min=min_reward, max=max_reward)
         t = (reward_clipped - min_reward) / (max_reward - min_reward)  # scales to [0, 1]
@@ -418,7 +418,7 @@ if __name__ == "__main__":
     agent = PPOAgent(
         env=env,
         lr=1e-4,
-        gamma=0.99,
+        gamma=0.999,
         gae_lambda=0.98,
         n_steps=2048,
         n_epochs=10,
@@ -426,7 +426,7 @@ if __name__ == "__main__":
         clip_range=0.2,
         entropy_coeff=0.01,  # Base entropy coefficient (not used in adaptive version)
         max_entropy_coeff=0.02,
-        value_coeff=0.6,# Maximum entropy coefficient for scaling
+        value_coeff=0.5,# Maximum entropy coefficient for scaling
         min_entropy_coeff=0.005  # Minimum entropy coefficient for scaling
     )
 
